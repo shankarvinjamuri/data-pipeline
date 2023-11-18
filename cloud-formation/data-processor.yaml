@@ -1,0 +1,216 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: This AWS CloudFormation template demonstrates the usage of Amazon S3, Amazon EventBridge, AWS Lambda, and AWS Glue job to ingest, transform, and store the results. **WARNING** You will be billed for the AWS resources used if you create a stack from this template.
+
+Parameters:
+  GlueScriptsBucketName:
+    Type: String    
+    Description: The name of the bucket that was created as part of the prerequisites, and holds the Glue job script.
+    ConstraintDescription: must provide a valid bucket name.    
+    AllowedPattern: ^[a-zA-Z0-9.\-_]{1,255}$
+
+  SourceRawBucketName:
+    Type: String    
+    Description: The name of the source bucket that holds the raw data.
+    ConstraintDescription: must provide a valid bucket name.
+    AllowedPattern: ^[a-zA-Z0-9.\-_]{1,255}$
+
+  SourceMerchantBucketName:
+    Type: String    
+    Description: The name of the source bucket that holds the merchant data.
+    ConstraintDescription: must provide a valid bucket name.
+    AllowedPattern: ^[a-zA-Z0-9.\-_]{1,255}$
+
+  TargetBucketName:
+    Type: String    
+    Description: The name of the target bucket that holds the transformed data.
+    ConstraintDescription: must provide a valid bucket name.
+    AllowedPattern: ^[a-zA-Z0-9.\-_]{1,255}$
+
+Resources:
+  #########################
+  # Create IAM role for Lambda function that invokes Glue job
+  #########################
+  LambdaTriggerForGlueJobRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service: "lambda.amazonaws.com"
+            Action: "sts:AssumeRole"
+      Path: "/"
+      Policies:
+        - PolicyName: "lambda-gluejob-trigger-policy"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: "Allow"
+                Action:
+                  - "glue:StartJobRun"
+                  - "glue:GetJobRun"
+                Resource: "*"
+      RoleName: acpy-lambda-gluejob-trigger-role
+
+  #########################
+  # Create IAM role for Glue job to access the S3 buckets
+  #########################
+  GlueJobRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service: "glue.amazonaws.com"
+            Action: "sts:AssumeRole"
+      Path: "/"
+      Policies:
+        - PolicyName: "gluejob-policy"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: "Allow"
+                Action:
+                  - "s3:*"
+                Resource:
+                  - !Sub arn:aws:s3:::${GlueScriptsBucketName}
+                  - !Sub arn:aws:s3:::${GlueScriptsBucketName}/*                  
+                  - !Sub arn:aws:s3:::${SourceRawBucketName}
+                  - !Sub arn:aws:s3:::${SourceRawBucketName}/*
+                  - !Sub arn:aws:s3:::${SourceMerchantBucketName}
+                  - !Sub arn:aws:s3:::${SourceMerchantBucketName}/*
+                  - !Sub arn:aws:s3:::${TargetBucketName}
+                  - !Sub arn:aws:s3:::${TargetBucketName}/*
+
+      RoleName: acpy-gluejob-role
+
+  #########################
+  # Create S3 buckets
+  #########################
+  SourceRawBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      AccessControl: Private
+      BucketName: !Ref SourceRawBucketName
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: TRUE
+        BlockPublicPolicy: TRUE
+        IgnorePublicAcls: TRUE
+        RestrictPublicBuckets: TRUE
+      NotificationConfiguration:
+        EventBridgeConfiguration:
+          EventBridgeEnabled: TRUE
+
+  SourceRawMerchantBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      AccessControl: Private
+      BucketName: !Ref SourceMerchantBucketName
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: TRUE
+        BlockPublicPolicy: TRUE
+        IgnorePublicAcls: TRUE
+        RestrictPublicBuckets: TRUE
+
+  TargetBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      AccessControl: Private
+      BucketName: !Ref TargetBucketName
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: TRUE
+        BlockPublicPolicy: TRUE
+        IgnorePublicAcls: TRUE
+        RestrictPublicBuckets: TRUE
+
+  #########################
+  # Create Lambda function to trigger the Glue Job
+  #########################
+
+  LambdaTriggerForGlueJobFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: acpy-lambda-trigger-glue
+      Role: !GetAtt LambdaTriggerForGlueJobRole.Arn
+      Runtime: python3.7
+      Handler: index.lambda_handler
+      Code:
+        ZipFile: |
+          import boto3
+          import urllib
+          glue = boto3.client('glue')
+          def lambda_handler(event, context):
+            gluejobname="acpy-glue-job"
+            runId = glue.start_job_run(JobName=gluejobname)
+            status = glue.get_job_run(JobName=gluejobname, RunId=runId['JobRunId'])
+
+  #########################
+  # Create Glue job that combine two datasets, apply mapping and transform to the target bucket
+  #########################
+
+  GlueJob:
+    Type: AWS::Glue::Job
+    Properties:
+      Command:
+        Name: glueetl        
+        ScriptLocation:
+          !Sub "s3://${GlueScriptsBucketName}/glue-etl-script.py"
+      ExecutionProperty:
+        MaxConcurrentRuns: 2
+      GlueVersion: "2.0"
+      MaxRetries: 0
+      Name: acpy-glue-job
+      NumberOfWorkers: 2
+      Role: !Ref GlueJobRole
+      WorkerType: G.1X
+
+  #########################
+  # Create EventBridge rule that triggers Lambda function
+  #########################
+
+  EventBridgeRule:
+    Type: AWS::Events::Rule
+    Properties:
+      EventBusName: default
+      EventPattern:
+        source:
+          - aws.s3
+        detail-type:
+          - Object Created
+        detail:
+          bucket:
+            name:
+              - !Sub ${SourceRawBucketName}
+      Name: acpy-eb-rule
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt LambdaTriggerForGlueJobFunction.Arn
+          Id: acpy-rule-id1
+
+  #########################
+  # Set permissions to invoke Lambda function from EventBridge
+  #########################
+
+  PermissionForEventsToInvokeLambda:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt LambdaTriggerForGlueJobFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: "events.amazonaws.com"
+      SourceArn: !GetAtt EventBridgeRule.Arn
+
+Outputs:
+  SourceRawBucket:
+    Description: Source Raw Data Bucket Name
+    Value: !Ref SourceRawBucket
+
+  SourceRawMerchantBucket:
+    Description: Source Raw Merchant Data Bucket Name
+    Value: !Ref SourceRawMerchantBucket
+
+  TargetBucket:
+    Description: Target Bucket
+    Value: !Ref TargetBucket
